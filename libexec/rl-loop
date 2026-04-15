@@ -1,0 +1,1150 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Ralph Loop -- AI development orchestrator (tk + Claude Code)
+#
+# INTERACTIVE (dialogue between human and agent):
+#   rl loop interview        # Claude interviews you, creates proposal
+#   rl loop bootstrap        # Claude creates tk tickets from the proposal
+#   rl loop                  # Build one ticket (you review between iterations)
+#   rl loop amend            # Amend specs/design to fix gaps, create new tickets
+#   rl loop archive          # Merge completed OpenSpec change into specs
+#   rl loop review           # Address PR review feedback
+#   rl loop e2e              # Fix E2E test failures
+#
+# AUTONOMOUS (silent, detached, end-to-end):
+#   rl loop --auto --pr      # Detects state, chains modes, builds to PR
+#   rl loop --auto --pr 20   # Same, max 20 build iterations
+#   rl loop review --auto    # Autonomous review cycle
+#   rl loop e2e --auto       # Autonomous E2E fix cycle
+#
+# FLAGS:
+#   --auto          Run headless (no human interaction)
+#   --pr            Create draft PR, mark ready when done (implies --push)
+#   --push          Push to remote after each iteration (default in --auto)
+#   --no-push       Don't push (default in interactive mode)
+#
+# SAFETY: Ralph NEVER merges or closes PRs. Humans merge.
+
+# ---------------------------------------------------------------------------
+# Path resolution
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="${0:A:h}"
+RL_TOOLKIT="${SCRIPT_DIR:h}"
+RL_CORE="$RL_TOOLKIT/resources/core"
+
+# Determine repo root
+if [[ -n "${RL_REPO_ROOT:-}" ]]; then
+  # Invoked via `rl loop` — RL_REPO_ROOT is set by the dispatcher
+  REPO_ROOT="$RL_REPO_ROOT"
+elif [[ -f "${RL_TOOLKIT}/.rl/config" ]]; then
+  # Dogfooding: rl toolkit has its own .rl/config
+  REPO_ROOT="$RL_TOOLKIT"
+elif [[ -f "${RL_TOOLKIT}/.ralphrc" ]]; then
+  # Legacy: repo still has .ralphrc (run `rl migrate` to upgrade)
+  REPO_ROOT="$RL_TOOLKIT"
+else
+  # Fallback: assume toolkit dir is repo root
+  REPO_ROOT="$RL_TOOLKIT"
+fi
+
+# Working directory for ephemeral files (reviews, manifests, e2e results)
+RL_WORK="${REPO_ROOT}/.rl"
+mkdir -p "$RL_WORK" 2>/dev/null || true
+
+# Load project configuration: .rl/config > .ralphrc (legacy fallback)
+# Source config with nounset temporarily off — config files may reference
+# variables that are only defined at runtime (e.g. in log strings)
+if [[ -f "$REPO_ROOT/.rl/config" ]]; then
+  set +u; source "$REPO_ROOT/.rl/config"; set -u
+elif [[ -f "$REPO_ROOT/.ralphrc" ]]; then
+  set +u; source "$REPO_ROOT/.ralphrc"; set -u
+fi
+
+# Configuration (override via environment, then config file, then defaults)
+BASE_BRANCH="${RALPH_BASE_BRANCH:-${BASE_BRANCH:-main}}"
+CLAUDE_MODEL="${RALPH_MODEL:-${CLAUDE_MODEL:-opus}}"
+REVIEW_WAIT_SECONDS="${RALPH_REVIEW_WAIT:-${REVIEW_WAIT:-90}}"
+DEFAULT_MAX_ITERATIONS="${RALPH_MAX_ITERATIONS:-${MAX_ITERATIONS:-25}}"
+BACKPRESSURE="${BACKPRESSURE_CMD:-npx nx affected -t lint test build}"
+USE_OPENSPEC="${USE_OPENSPEC:-true}"
+BACKPRESSURE_TIMEOUT="${RALPH_BACKPRESSURE_TIMEOUT:-${BACKPRESSURE_TIMEOUT:-600}}"
+E2E_TIMEOUT="${RALPH_E2E_TIMEOUT:-${E2E_TIMEOUT:-300}}"
+USE_COPILOT_REVIEWS="${RALPH_USE_COPILOT_REVIEWS:-${USE_COPILOT_REVIEWS:-true}}"
+USE_GREPTILE_REVIEWS="${RALPH_USE_GREPTILE_REVIEWS:-${USE_GREPTILE_REVIEWS:-false}}"
+
+# Defaults
+MODE="build"
+MAX_ITERATIONS=0
+AUTO_MODE=false
+PR_MODE=false
+PUSH_MODE=""
+
+# Parse arguments (order-independent)
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    interview|bootstrap|amend|archive|plan|review|e2e|build)
+      MODE="$1"
+      shift
+      ;;
+    --auto)
+      AUTO_MODE=true
+      shift
+      ;;
+    --pr)
+      PR_MODE=true
+      shift
+      ;;
+    --push)
+      PUSH_MODE=true
+      shift
+      ;;
+    --no-push)
+      PUSH_MODE=false
+      shift
+      ;;
+    [0-9]*)
+      MAX_ITERATIONS="$1"
+      shift
+      ;;
+    -h|--help)
+      head -28 "$0" | tail -26
+      exit 0
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Dogfooding safety: warn when --auto is used on the rl toolkit itself
+# The loop modifies the same files it runs from — auto mode risks breaking
+# the loop mid-run with no human checkpoint.
+# ---------------------------------------------------------------------------
+if [[ "$AUTO_MODE" == "true" && -f "$REPO_ROOT/libexec/rl-loop" && -f "$REPO_ROOT/lib/common.sh" ]]; then
+  echo ""
+  echo "⚠️  DOGFOODING SAFETY WARNING"
+  echo ""
+  echo "You are running --auto on the rl toolkit itself."
+  echo "In auto mode, the loop can modify its own scripts, skills, and prompts"
+  echo "without a human checkpoint between iterations. If an iteration introduces"
+  echo "a bug in loop.sh, skills.sh, or lib/common.sh, the next iteration may fail"
+  echo "or behave incorrectly — and the loop can't fix itself."
+  echo ""
+  echo "Recommended: run without --auto so you can review changes between iterations."
+  echo ""
+  if [[ -t 0 ]]; then
+    # Interactive terminal — ask for confirmation
+    print -n "Continue with --auto anyway? [y/N] "
+    read -r confirm
+    if [[ ! "${confirm:-N}" =~ ^[Yy] ]]; then
+      echo "Aborting. Run without --auto for safer dogfooding."
+      exit 0
+    fi
+    echo "Proceeding with --auto (you've been warned)."
+    echo ""
+  else
+    # Non-interactive (piped/detached) — refuse
+    echo "ERROR: --auto on the rl toolkit requires interactive confirmation."
+    echo "Run interactively, or set RL_DOGFOOD_AUTO=true to override."
+    if [[ "${RL_DOGFOOD_AUTO:-}" != "true" ]]; then
+      exit 1
+    fi
+  fi
+fi
+
+# Derive push behavior
+if [[ -z "$PUSH_MODE" ]]; then
+  if [[ "$AUTO_MODE" == "true" ]]; then
+    PUSH_MODE=true
+  else
+    PUSH_MODE=false
+  fi
+fi
+
+if [[ "$PR_MODE" == "true" ]]; then
+  PUSH_MODE=true
+fi
+
+# Handle legacy "plan" mode
+if [[ "$MODE" == "plan" ]]; then
+  echo "NOTE: 'plan' mode is now 'interview'. Redirecting..."
+  MODE="interview"
+fi
+
+# Default iterations
+if [[ $MAX_ITERATIONS -eq 0 ]]; then
+  case "$MODE" in
+    interview|bootstrap|amend|archive)
+      MAX_ITERATIONS=1
+      ;;
+    *)
+      if [[ "$AUTO_MODE" == "true" ]]; then
+        MAX_ITERATIONS="$DEFAULT_MAX_ITERATIONS"
+      else
+        MAX_ITERATIONS=1
+      fi
+      ;;
+  esac
+fi
+
+# Map mode to prompt file
+typeset -A PROMPT_FILES=(
+  [interview]="$RL_CORE/PROMPT_interview.md"
+  [bootstrap]="$RL_CORE/PROMPT_bootstrap.md"
+  [amend]="$RL_CORE/PROMPT_amend.md"
+  [build]="$RL_CORE/PROMPT_build.md"
+  [archive]="$RL_CORE/PROMPT_archive.md"
+  [review]="$RL_CORE/PROMPT_review.md"
+  [e2e]="$RL_CORE/PROMPT_e2e.md"
+)
+
+PROMPT_FILE="${PROMPT_FILES[$MODE]}"
+
+# Verify we're in a git repo and on a feature branch
+cd "$REPO_ROOT"
+CURRENT_BRANCH=$(git branch --show-current)
+if [[ "$CURRENT_BRANCH" == "$BASE_BRANCH" || "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
+  echo "ERROR: You are on '$CURRENT_BRANCH'. Create a feature branch first:"
+  echo "  git checkout -b ralph/my-feature"
+  exit 1
+fi
+
+# Verify prompt file exists (skip for auto pipeline -- we check per-stage)
+if [[ "$AUTO_MODE" != "true" || "$MODE" != "build" ]] && [[ ! -f "$PROMPT_FILE" ]]; then
+  echo "ERROR: Prompt file not found: $PROMPT_FILE"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Cleanup trap: remove stale locks on unexpected exit
+# ---------------------------------------------------------------------------
+cleanup_on_exit() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 && -f "$REPO_ROOT/.git/index.lock" ]]; then
+    echo ""
+    echo "WARNING: Removing stale .git/index.lock left by crashed process."
+    rm -f "$REPO_ROOT/.git/index.lock"
+  fi
+}
+trap cleanup_on_exit EXIT
+
+# Display banner
+echo "============================================"
+echo "  Ralph Loop -- $MODE mode"
+if [[ "$AUTO_MODE" == "true" ]]; then
+  echo "  Execution: AUTONOMOUS (headless)"
+else
+  echo "  Execution: INTERACTIVE (dialogue)"
+fi
+echo "  Max iterations: $MAX_ITERATIONS"
+echo "  Push: $PUSH_MODE | PR: $PR_MODE"
+echo "  Branch: $CURRENT_BRANCH -> $BASE_BRANCH"
+echo "  Model: $CLAUDE_MODEL"
+echo "============================================"
+
+# ============================================
+# Skill sync: ensure .claude/skills/ has latest from rl source
+# ============================================
+sync_skills() {
+  local rl_home="${RL_HOME:-$RL_TOOLKIT}"
+  local skills_src="$rl_home/resources/skills"
+
+  # Only sync if we can find the rl skills source
+  if [[ ! -d "$skills_src/rl" ]]; then
+    return
+  fi
+
+  setopt local_options nullglob
+  mkdir -p "$REPO_ROOT/.claude/skills"
+  mkdir -p "$REPO_ROOT/.rl/skills"
+
+  # Helper: before overwriting a skill, check if it was modified by the agent.
+  # If so, auto-promote the modified version to .rl/skills/ so it persists.
+  promote_if_modified() {
+    local skill_name="$1" source_file="$2"
+    local target="$REPO_ROOT/.claude/skills/$skill_name/SKILL.md"
+    local override="$REPO_ROOT/.rl/skills/$skill_name/SKILL.md"
+
+    # Skip if there's already an override (user manages it)
+    [[ -f "$override" ]] && return
+
+    # Skip if target doesn't exist yet (first sync)
+    [[ -f "$target" ]] || return 0
+
+    # Compare target (what's in .claude/skills/) with what we're about to write
+    if ! diff -q "$target" "$source_file" &>/dev/null; then
+      # The file in .claude/skills/ differs from what sync would write —
+      # the agent (or user) modified it. Promote to .rl/skills/ to persist.
+      mkdir -p "$REPO_ROOT/.rl/skills/$skill_name"
+      cp "$target" "$override"
+      echo "  ↑ Promoted modified skill to .rl/skills/$skill_name/ (persists across syncs)"
+    fi
+  }
+
+  # Universal skills (always)
+  for skill_dir in "$skills_src/universal"/*/; do
+    [[ -d "$skill_dir" ]] || continue
+    local skill_name="${skill_dir:t}"
+    promote_if_modified "$skill_name" "$skill_dir/SKILL.md"
+    mkdir -p "$REPO_ROOT/.claude/skills/$skill_name"
+    cp "$skill_dir/SKILL.md" "$REPO_ROOT/.claude/skills/$skill_name/" 2>/dev/null || true
+  done
+
+  # rl skills (check sync condition per skill)
+  for skill_dir in "$skills_src/rl"/*/; do
+    [[ -d "$skill_dir" ]] || continue
+    local skill_name="${skill_dir:t}"
+    # Read sync condition from SKILL.md
+    local sync_cond="always"
+    if [[ -f "$skill_dir/SKILL.md" ]]; then
+      local found_cond=$(sed -n 's/.*<!-- *sync: *\([a-z]*\) *-->.*/\1/p' "$skill_dir/SKILL.md" 2>/dev/null | head -1)
+      [[ -n "$found_cond" ]] && sync_cond="$found_cond"
+    fi
+    case "$sync_cond" in
+      openspec)   [[ "$USE_OPENSPEC" != "true" ]] && continue ;;
+      dogfooding) [[ ! -f "$REPO_ROOT/libexec/rl-loop" ]] && continue ;;
+    esac
+    promote_if_modified "$skill_name" "$skill_dir/SKILL.md"
+    mkdir -p "$REPO_ROOT/.claude/skills/$skill_name"
+    cp "$skill_dir/SKILL.md" "$REPO_ROOT/.claude/skills/$skill_name/" 2>/dev/null || true
+  done
+
+  # Apply project-specific overrides last (highest precedence)
+  if [[ -d "$REPO_ROOT/.rl/skills" ]]; then
+    for skill_dir in "$REPO_ROOT/.rl/skills"/*/; do
+      [[ -d "$skill_dir" ]] || continue
+      local skill_name="${skill_dir:t}"
+      mkdir -p "$REPO_ROOT/.claude/skills/$skill_name"
+      cp "$skill_dir/SKILL.md" "$REPO_ROOT/.claude/skills/$skill_name/" 2>/dev/null || true
+    done
+  fi
+}
+
+# Sync skills before any mode runs
+sync_skills
+
+# ============================================
+# Helper functions
+# ============================================
+
+run_backpressure() {
+  local timeout_seconds="${BACKPRESSURE_TIMEOUT:-600}"
+  echo ""
+  echo "Running backpressure: $BACKPRESSURE ... (timeout: ${timeout_seconds}s)"
+
+  # Build command with timeout wrapper if available
+  local exit_code=0
+  if command -v timeout &>/dev/null; then
+    timeout "$timeout_seconds" bash -c "$BACKPRESSURE" 2>&1 || exit_code=$?
+  elif command -v gtimeout &>/dev/null; then
+    gtimeout "$timeout_seconds" bash -c "$BACKPRESSURE" 2>&1 || exit_code=$?
+  else
+    eval "$BACKPRESSURE" 2>&1 || exit_code=$?
+  fi
+
+  if [[ $exit_code -eq 124 ]]; then
+    echo ""
+    echo "ERROR: Backpressure timed out after ${timeout_seconds}s."
+    return 1
+  elif [[ $exit_code -ne 0 ]]; then
+    echo "Backpressure FAILED."
+    return 1
+  fi
+
+  echo "Backpressure PASSED."
+
+  # E2E gate: if E2E_CMD is configured and E2E-related files were modified, run change-scoped E2E tests
+  if [[ -n "${E2E_CMD:-}" ]]; then
+    local e2e_timeout="${E2E_TIMEOUT:-300}"
+    local change_id
+    change_id=$(get_active_change_id)
+    local e2e_tag=""
+    local e2e_label=""
+
+    # Use change-scoped tag if available, fall back to @smoke
+    if [[ -n "$change_id" ]]; then
+      e2e_tag="@${change_id}"
+      e2e_label="change-scoped ($e2e_tag)"
+    else
+      e2e_tag="@smoke"
+      e2e_label="smoke (@smoke)"
+    fi
+
+    echo ""
+    echo "Running ${e2e_label} E2E tests..."
+
+    local e2e_exit=0
+    if command -v timeout &>/dev/null; then
+      timeout "$e2e_timeout" bash -c "$E2E_CMD" 2>&1 || e2e_exit=$?
+    elif command -v gtimeout &>/dev/null; then
+      gtimeout "$e2e_timeout" bash -c "$E2E_CMD" 2>&1 || e2e_exit=$?
+    else
+      eval "$E2E_CMD" 2>&1 || e2e_exit=$?
+    fi
+
+    if [[ $e2e_exit -eq 124 ]]; then
+      echo "ERROR: E2E tests timed out after ${e2e_timeout}s."
+      return 1
+    elif [[ $e2e_exit -ne 0 ]]; then
+      echo "E2E ${e2e_label} tests FAILED."
+      return 1
+    fi
+    echo "E2E ${e2e_label} tests PASSED."
+  fi
+
+  return 0
+}
+
+run_claude() {
+  local prompt_source="$1"
+
+  if [[ "$AUTO_MODE" == "true" ]]; then
+    cat "$prompt_source" | claude -p --dangerously-skip-permissions --model "$CLAUDE_MODEL" --verbose
+  else
+    echo ""
+    echo "Starting interactive Claude Code session..."
+    echo "  Prompt: $prompt_source"
+    echo "  You can watch, guide, or interrupt Claude as it works."
+    echo "  When Claude finishes, exit the session (type /exit or Ctrl+C)."
+    echo ""
+    claude --model "$CLAUDE_MODEL" --verbose "$(cat "$prompt_source")" || true
+  fi
+}
+
+run_claude_selfheal() {
+  local message="$1"
+  echo "$message" | claude -p --dangerously-skip-permissions --model "$CLAUDE_MODEL" --verbose
+}
+
+commit_if_dirty() {
+  local msg="${1:-fix(review): address PR feedback}"
+
+  # Clean up stale index.lock from crashed git processes
+  if [[ -f "$REPO_ROOT/.git/index.lock" ]]; then
+    local lock_age
+    lock_age=$(( $(date +%s) - $(stat -f %m "$REPO_ROOT/.git/index.lock" 2>/dev/null || echo "0") ))
+    if [[ $lock_age -gt 30 ]]; then
+      echo "WARNING: Removing stale .git/index.lock (age: ${lock_age}s)"
+      rm -f "$REPO_ROOT/.git/index.lock"
+    fi
+  fi
+
+  # Check for uncommitted changes (staged, unstaged, or untracked)
+  if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    echo "Committing uncommitted changes..."
+    git add -A
+    # Safety-net commit uses --no-verify: Claude already had its chance to
+    # commit with hooks. If hooks blocked Claude, they'll block us too,
+    # creating an unrecoverable loop that crashes the entire script.
+    git commit --no-verify -m "$msg" || echo "WARNING: commit failed (possibly nothing to commit)"
+  else
+    echo "(No uncommitted changes to commit)"
+  fi
+}
+
+maybe_push() {
+  if [[ "$PUSH_MODE" == "true" ]]; then
+    echo "Pushing changes..."
+    git push origin "$CURRENT_BRANCH" 2>&1 || true
+  else
+    echo "(Skipping push -- use --push or --auto to push automatically)"
+  fi
+}
+
+get_pr_number() {
+  gh pr list --head "$CURRENT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo ""
+}
+
+create_draft_pr() {
+  local title="Ralph: ${CURRENT_BRANCH#ralph/}"
+  local body="Automated draft PR created by Ralph Loop. Tasks tracked via \`tk ls\`."
+
+  echo "Creating draft PR: $title"
+  gh pr create --draft \
+    --base "$BASE_BRANCH" \
+    --title "$title" \
+    --body "$body" 2>&1 || echo "WARNING: Failed to create draft PR"
+}
+
+# Check if all tk task tickets are complete
+# Returns false (1) if no tickets exist -- "no work started" != "all done"
+all_tasks_complete() {
+  local closed_count
+  closed_count=$(tk ls --status=closed 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$closed_count" -eq 0 ]]; then
+    return 1
+  fi
+  local open_count
+  open_count=$(tk ls --status=open 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$open_count" -gt 0 ]]; then
+    return 1
+  fi
+  local ip_count
+  ip_count=$(tk ls --status=in_progress 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$ip_count" -gt 0 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Check if tickets exist at all
+has_tickets() {
+  local count
+  count=$(tk ls 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$count" -gt 0 ]]
+}
+
+# Check if an OpenSpec change proposal exists
+has_openspec_change() {
+  if [[ "$USE_OPENSPEC" != "true" ]]; then
+    return 1
+  fi
+  local changes
+  changes=$(OPENSPEC_TELEMETRY=0 npx openspec list 2>/dev/null | grep -v "^$" | grep -v "No active" || true)
+  [[ -n "$changes" ]]
+}
+
+# Check if an IMPLEMENTATION_PLAN.md exists (non-OpenSpec alternative)
+has_implementation_plan() {
+  [[ -f "$REPO_ROOT/IMPLEMENTATION_PLAN.md" ]]
+}
+
+# Find the active OpenSpec change ID from the epic ticket's external-ref
+get_active_change_id() {
+  [[ -d .tickets ]] || { echo ""; return; }
+  for ticket_file in .tickets/*.md; do
+    [[ -f "$ticket_file" ]] || continue
+    local ext_ref
+    ext_ref=$(sed -n '/^---$/,/^---$/p' "$ticket_file" | grep "^external-ref:" | sed 's/^external-ref: *//' || true)
+    if [[ "$ext_ref" == openspec:* ]]; then
+      echo "${ext_ref#openspec:}"
+      return
+    fi
+  done
+  echo ""
+}
+
+# Update draft PR body with completion summary -- Ralph does NOT mark PRs ready by default
+update_pr_summary() {
+  local pr_number="$1"
+  echo "All tasks complete! Draft PR #$pr_number updated with summary."
+  echo "(Ralph does NOT mark PRs ready-for-review. A human must do that after reviewing.)"
+
+  local completed_items
+  completed_items=$(tk closed --limit=20 2>/dev/null || echo "See tk closed for details")
+
+  gh pr edit "$pr_number" \
+    --body "$(cat <<EOF
+## Summary
+
+Completed by Ralph Loop autonomous development.
+
+### Completed Tickets
+\`\`\`
+$completed_items
+\`\`\`
+
+## Validation
+- All unit tests passing
+- Lint clean
+- Build successful
+- Review feedback addressed
+
+## Requires Human Review
+- [ ] Code review
+- [ ] E2E test verification
+- [ ] Human marks PR ready-for-review
+- [ ] Human merges when satisfied
+EOF
+)" 2>&1 || true
+}
+
+maybe_manage_pr() {
+  if [[ "$PR_MODE" != "true" ]]; then
+    return
+  fi
+
+  local pr_number
+  pr_number=$(get_pr_number)
+
+  if [[ -z "$pr_number" ]]; then
+    create_draft_pr
+    pr_number=$(get_pr_number)
+    echo "Draft PR #$pr_number created."
+  fi
+
+  if all_tasks_complete; then
+    echo "All tk tickets are complete!"
+    update_pr_summary "$pr_number"
+  fi
+}
+
+prompt_continue() {
+  if [[ "$AUTO_MODE" == "true" ]]; then
+    return 0
+  fi
+
+  echo ""
+  echo "============================================"
+  echo "  Iteration complete. Review the changes."
+  echo "============================================"
+  echo ""
+  echo "  [enter]  Continue to next iteration"
+  echo "  s        Skip to push (no more iterations)"
+  echo "  q        Quit (no push)"
+  echo ""
+  printf "Continue? [enter/s/q] " > /dev/tty
+  read -r choice < /dev/tty
+  case "$choice" in
+    s|S)
+      echo "Skipping to push..."
+      maybe_push
+      maybe_manage_pr
+      return 1
+      ;;
+    q|Q)
+      echo "Quitting. Changes are committed locally."
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+# ============================================
+# Mode: interview (always interactive)
+# ============================================
+run_interview_mode() {
+  if [[ "$AUTO_MODE" == "true" ]]; then
+    echo "ERROR: Interview mode requires human dialogue. Run without --auto:"
+    echo "  rl loop interview"
+    exit 1
+  fi
+
+  echo ""
+  echo "--- Interview mode ---"
+  echo "Claude will interview you about what you want built,"
+  if [[ "$USE_OPENSPEC" == "true" ]]; then
+    echo "then create an OpenSpec proposal and IMPLEMENTATION_PLAN.md."
+  else
+    echo "then create an IMPLEMENTATION_PLAN.md and prepare for ticket creation."
+  fi
+  echo ""
+
+  run_claude "$PROMPT_FILE"
+  maybe_push
+
+  echo ""
+  echo "============================================"
+  echo "  Interview complete."
+  echo "  Next: rl loop bootstrap"
+  echo "============================================"
+}
+
+# ============================================
+# Mode: bootstrap
+# ============================================
+run_bootstrap_mode() {
+  echo ""
+  echo "--- Bootstrap mode ---"
+  echo "Claude will read the proposal and create tk tickets."
+  echo ""
+
+  if [[ "$USE_OPENSPEC" == "true" ]]; then
+    if ! has_openspec_change; then
+      echo "ERROR: No OpenSpec change found. Run interview first:"
+      echo "  rl loop interview"
+      exit 1
+    fi
+  else
+    if ! has_implementation_plan; then
+      echo "ERROR: No IMPLEMENTATION_PLAN.md found. Run interview first:"
+      echo "  rl loop interview"
+      exit 1
+    fi
+  fi
+
+  run_claude "$PROMPT_FILE"
+
+  if ! has_tickets; then
+    echo ""
+    echo "ERROR: Bootstrap failed -- no tk tickets were created."
+    echo "Claude ran but did not produce tickets. Check the prompt output above."
+    exit 1
+  fi
+
+  maybe_push
+
+  echo ""
+  echo "Ticket queue:"
+  tk ready 2>/dev/null || echo "(no tickets ready)"
+  echo ""
+  echo "============================================"
+  echo "  Bootstrap complete."
+  echo "  Next: rl loop    (or rl loop --auto --pr)"
+  echo "============================================"
+}
+
+# ============================================
+# Mode: amend (always interactive)
+# ============================================
+run_amend_mode() {
+  if [[ "$AUTO_MODE" == "true" ]]; then
+    echo "ERROR: Amend mode requires human dialogue. Run without --auto:"
+    echo "  rl loop amend"
+    exit 1
+  fi
+
+  echo ""
+  echo "--- Amend mode ---"
+  echo "Claude will help you diagnose spec gaps, amend planning artifacts,"
+  echo "and create/update tickets to fill the gap."
+  echo ""
+
+  if [[ "$USE_OPENSPEC" == "true" ]] && ! has_openspec_change; then
+    echo "ERROR: No OpenSpec change found. Nothing to amend."
+    exit 1
+  fi
+
+  run_claude "$PROMPT_FILE"
+  maybe_push
+
+  echo ""
+  echo "Ticket queue after amendment:"
+  tk ready 2>/dev/null || echo "(no tickets ready)"
+  echo ""
+  echo "============================================"
+  echo "  Amendment complete."
+  echo "  Next: rl loop    (to build new tickets)"
+  echo "============================================"
+}
+
+# ============================================
+# Mode: archive
+# ============================================
+run_archive_mode() {
+  if [[ "$USE_OPENSPEC" != "true" ]]; then
+    echo "Archive mode requires OpenSpec. Skipping."
+    return
+  fi
+
+  echo ""
+  echo "--- Archive mode ---"
+
+  local change_id
+  change_id=$(get_active_change_id)
+  if [[ -n "$change_id" ]]; then
+    echo "Archiving OpenSpec change: $change_id"
+  else
+    echo "Archiving OpenSpec change..."
+  fi
+  echo ""
+
+  run_claude "$PROMPT_FILE"
+  maybe_push
+  maybe_manage_pr
+
+  echo ""
+  echo "============================================"
+  echo "  Archive complete. Specs updated."
+  echo "============================================"
+}
+
+# ============================================
+# Mode: review
+# ============================================
+run_review_mode() {
+  local iteration=0
+
+  # Recover from a previous crash: commit any dirty state as a checkpoint
+  if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    echo ""
+    echo "WARNING: Dirty working tree detected (likely from a crashed iteration)."
+    echo "Committing as recovery checkpoint..."
+    commit_if_dirty "wip: recover uncommitted changes from crashed iteration"
+  fi
+
+  # Clean up stale review ID tracking from previous runs
+  rm -f "$RL_WORK/last-review-ids.txt"
+
+  while true; do
+    iteration=$((iteration + 1))
+    echo ""
+    echo "--- Review iteration $iteration / $MAX_ITERATIONS ---"
+
+    # Clean up stale manifest from previous iteration
+    rm -f "$RL_WORK/review-manifest.json"
+
+    # Save previous review IDs for comparison (before fetch overwrites)
+    local prev_ids_file="$RL_WORK/prev-review-ids.txt"
+    if [[ -f "$RL_WORK/last-review-ids.txt" ]]; then
+      cp "$RL_WORK/last-review-ids.txt" "$prev_ids_file"
+    else
+      : > "$prev_ids_file"
+    fi
+
+    echo "Fetching PR reviews..."
+    local fetch_exit=0
+    RL_WORK="$RL_WORK" USE_COPILOT_REVIEWS="$USE_COPILOT_REVIEWS" USE_GREPTILE_REVIEWS="$USE_GREPTILE_REVIEWS" "$SCRIPT_DIR/rl-fetch-reviews" || fetch_exit=$?
+    if [[ $fetch_exit -eq 1 ]]; then
+      echo "No unresolved PR reviews found."
+      # Warn if uncommitted changes exist
+      if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+        echo ""
+        echo "WARNING: Uncommitted or untracked changes detected."
+        echo "  Run 'git status' to inspect, then commit manually if appropriate."
+      fi
+      echo "Review complete!"
+      break
+    elif [[ $fetch_exit -ge 2 ]]; then
+      echo "ERROR: Failed to fetch reviews (exit code $fetch_exit)."
+      exit 1
+    fi
+
+    # No-new-reviews exit: if comment IDs are identical to previous iteration,
+    # the reviewer is satisfied — no new feedback was posted after re-trigger.
+    if [[ $iteration -gt 1 && -f "$prev_ids_file" && -f "$RL_WORK/last-review-ids.txt" ]]; then
+      if diff -q "$prev_ids_file" "$RL_WORK/last-review-ids.txt" &>/dev/null; then
+        echo "No new review comments since last iteration — reviewer satisfied."
+        rm -f "$prev_ids_file"
+        break
+      fi
+    fi
+    rm -f "$prev_ids_file"
+
+    run_claude "$PROMPT_FILE"
+
+    # Safety net: commit any changes Claude made but didn't commit
+    # Generate a descriptive message from the review manifest if available
+    local review_commit_msg="fix(review): address PR #$(get_pr_number) feedback"
+    if [[ -f "$RL_WORK/review-manifest.json" ]]; then
+      local manifest_summary
+      manifest_summary=$(jq -r '[.[] | select(.category == "code-fix") | .reply | sub("^\\[Ralph\\] "; "") | sub("\\. Verified.*$"; "") | .[0:80]] | join("; ")' "$RL_WORK/review-manifest.json" 2>/dev/null || echo "")
+      if [[ -n "$manifest_summary" ]]; then
+        review_commit_msg="fix(review): ${manifest_summary:0:72}"
+      fi
+    fi
+    commit_if_dirty "$review_commit_msg"
+
+    if ! run_backpressure; then
+      echo "WARNING: Backpressure failed. Attempting self-heal..."
+      run_claude_selfheal "The last backpressure run ($BACKPRESSURE) FAILED. Fix all failures."
+      commit_if_dirty "fix(review): backpressure self-heal"
+      if ! run_backpressure; then
+        echo "ERROR: Backpressure still failing after self-heal. Stopping."
+        echo ""
+        echo "============================================"
+        echo "  Review fixes were applied but backpressure is broken."
+        echo ""
+        echo "  Next steps:"
+        echo "    1. Fix backpressure manually:"
+        echo "       $BACKPRESSURE"
+        echo ""
+        if [[ -f "$RL_WORK/review-manifest.json" ]]; then
+          local pending
+          pending=$(jq 'length' "$RL_WORK/review-manifest.json" 2>/dev/null || echo "?")
+          echo "    2. Post pending review replies ($pending threads):"
+          echo "       $SCRIPT_DIR/rl-reply-reviews"
+          echo ""
+          echo "    Or re-run the full review loop after fixing:"
+          echo "       rl loop review --auto"
+        else
+          echo "    2. Re-run the review loop after fixing:"
+          echo "       rl loop review --auto"
+        fi
+        echo "============================================"
+        exit 1
+      fi
+    fi
+
+    maybe_push
+    maybe_manage_pr
+
+    # Post replies and resolve threads (only if manifest exists and push succeeded)
+    if [[ -f "$SCRIPT_DIR/rl-reply-reviews" && -f "$RL_WORK/review-manifest.json" ]]; then
+      echo "Posting replies and resolving review threads..."
+      RL_WORK="$RL_WORK" USE_COPILOT_REVIEWS="$USE_COPILOT_REVIEWS" USE_GREPTILE_REVIEWS="$USE_GREPTILE_REVIEWS" "$SCRIPT_DIR/rl-reply-reviews" || echo "WARNING: Some replies/resolves failed (non-fatal)."
+    fi
+
+    # Re-trigger review providers
+    local pr_num
+    pr_num=$(get_pr_number)
+    if [[ -n "$pr_num" ]]; then
+      local repo_full
+      repo_full=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || echo "")
+
+      if [[ "$USE_GREPTILE_REVIEWS" == "true" && -n "$repo_full" ]]; then
+        echo "Re-triggering Greptile review on PR #$pr_num..."
+        gh api "repos/$repo_full/issues/$pr_num/comments" \
+          -X POST -f body="@greptileai re-review" >/dev/null 2>&1 \
+          || echo "WARNING: Could not re-trigger Greptile review (non-fatal)."
+      fi
+
+      if [[ "$USE_COPILOT_REVIEWS" == "true" ]]; then
+        echo "Re-requesting Copilot review on PR #$pr_num..."
+        gh pr edit "$pr_num" --add-reviewer "@copilot" 2>/dev/null \
+          || echo "WARNING: Could not re-request Copilot review (non-fatal)."
+      fi
+    fi
+
+    if [[ $iteration -ge $MAX_ITERATIONS ]]; then
+      echo "Reached max iterations ($MAX_ITERATIONS). Stopping."
+      break
+    fi
+
+    if ! prompt_continue; then break; fi
+
+    if [[ "$AUTO_MODE" == "true" && "$PUSH_MODE" == "true" ]]; then
+      echo "Waiting ${REVIEW_WAIT_SECONDS}s for re-review..."
+      sleep "$REVIEW_WAIT_SECONDS"
+    fi
+  done
+}
+
+# ============================================
+# Mode: e2e
+# ============================================
+run_e2e_mode() {
+  local iteration=0
+  local -a e2e_args=()
+  if [[ -n "${1:-}" ]]; then
+    e2e_args=("$1")
+  fi
+
+  while true; do
+    iteration=$((iteration + 1))
+    echo ""
+    echo "--- E2E iteration $iteration / $MAX_ITERATIONS ---"
+
+    echo "Running E2E tests..."
+    if "$SCRIPT_DIR/rl-run-e2e" "${e2e_args[@]+"${e2e_args[@]}"}"; then
+      echo "E2E failures detected. Addressing with Claude Code..."
+      run_claude "$PROMPT_FILE"
+      maybe_push
+    else
+      echo "All E2E tests passing! Done."
+      break
+    fi
+
+    if [[ $iteration -ge $MAX_ITERATIONS ]]; then
+      echo "Reached max iterations ($MAX_ITERATIONS). Stopping."
+      break
+    fi
+
+    if ! prompt_continue; then break; fi
+  done
+}
+
+# ============================================
+# Mode: build
+# ============================================
+run_build_mode() {
+  local iteration=0
+
+  # Recover from a previous crash: if there are uncommitted changes, commit
+  # them as a checkpoint so Claude starts each iteration from a clean tree.
+  local recovered=false
+  if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    echo ""
+    echo "WARNING: Dirty working tree detected (likely from a crashed iteration)."
+    echo "Committing as recovery checkpoint..."
+    commit_if_dirty "wip: recover uncommitted changes from crashed iteration"
+    recovered=true
+  fi
+
+  while true; do
+    iteration=$((iteration + 1))
+    echo ""
+    echo "--- Build iteration $iteration / $MAX_ITERATIONS ---"
+
+    # Show ticket queue (tasks only, not epics)
+    echo "Ticket queue:"
+    tk ready 2>/dev/null | grep -v '\[.*epic' || echo "(no ready tickets)"
+    echo ""
+
+    # After crash recovery, check for in_progress tickets whose work may
+    # already be done. Inject context so Claude reconciles instead of redoing.
+    if [[ "$recovered" == "true" ]]; then
+      local ip_tickets
+      ip_tickets=$(tk ls --status=in_progress 2>/dev/null || true)
+      if [[ -n "$ip_tickets" ]]; then
+        echo "RECOVERY NOTE: The previous iteration crashed after code changes"
+        echo "were made but before ticket status was updated. These tickets are"
+        echo "still in_progress and may already be complete:"
+        echo "$ip_tickets"
+        echo ""
+        echo "The recovered changes were committed as a checkpoint."
+        echo "Claude should verify and close completed tickets before starting new work."
+        echo ""
+
+        # Write a recovery hint that gets prepended to the build prompt
+        cat > "$RL_WORK/recovery-hint.md" <<HINT
+## Crash Recovery
+
+The previous loop iteration crashed. Code changes were recovered and committed.
+The following tickets are in_progress and may already be complete — verify before starting new work:
+
+$ip_tickets
+
+Check the recovered commit (\`git log -1\`) and the ticket requirements. If the work is done, close the ticket with \`tk close <id>\`. Then proceed to the next ready ticket.
+HINT
+      fi
+      recovered=false
+    fi
+
+    # If recovery hint exists, prepend it to the prompt so Claude sees it
+    if [[ -f "$RL_WORK/recovery-hint.md" ]]; then
+      local combined_prompt="$RL_WORK/combined-prompt.md"
+      cat "$RL_WORK/recovery-hint.md" "$PROMPT_FILE" > "$combined_prompt"
+      run_claude "$combined_prompt"
+      rm -f "$RL_WORK/recovery-hint.md" "$combined_prompt"
+    else
+      run_claude "$PROMPT_FILE"
+    fi
+
+    # Safety net: commit any changes Claude made but didn't commit
+    commit_if_dirty "feat: implement ticket changes"
+
+    if ! run_backpressure; then
+      echo ""
+      echo "WARNING: Backpressure failed. Attempting self-heal..."
+
+      run_claude_selfheal "The last backpressure run ($BACKPRESSURE) FAILED. Read the errors, fix all lint/test/build failures, then run backpressure again. Do NOT commit until all checks pass."
+      commit_if_dirty "fix: backpressure self-heal"
+
+      if ! run_backpressure; then
+        echo "ERROR: Backpressure still failing. Stopping."
+        echo "Fix manually and resume: rl loop"
+        exit 1
+      fi
+    fi
+
+    maybe_push
+    maybe_manage_pr
+
+    if all_tasks_complete; then
+      echo ""
+      echo "============================================"
+      echo "  All tk tickets are complete!"
+      echo ""
+      if [[ "$USE_OPENSPEC" == "true" ]]; then
+        echo "  Before archiving, verify the implementation:"
+        echo "    rl loop amend    # if gaps found"
+        echo "    rl loop archive  # when ready"
+      fi
+      echo "============================================"
+      maybe_manage_pr
+      break
+    fi
+
+    if [[ $iteration -ge $MAX_ITERATIONS ]]; then
+      echo "Reached max iterations ($MAX_ITERATIONS). Stopping."
+      break
+    fi
+
+    if ! prompt_continue; then break; fi
+  done
+
+  echo ""
+  echo "============================================"
+  echo "  Ralph Loop finished (build mode)"
+  echo "  Iterations: $iteration"
+  echo "============================================"
+}
+
+# ============================================
+# Autonomous pipeline
+# ============================================
+run_auto_pipeline() {
+  echo ""
+  echo "--- Autonomous pipeline: detecting state ---"
+
+  local has_change=false
+  local has_plan=false
+  local has_tix=false
+
+  if has_openspec_change; then
+    has_change=true
+    echo "  OpenSpec change: found"
+  else
+    echo "  OpenSpec change: none"
+  fi
+
+  if has_implementation_plan; then
+    has_plan=true
+    echo "  Implementation plan: found"
+  else
+    echo "  Implementation plan: none"
+  fi
+
+  if has_tickets; then
+    has_tix=true
+    echo "  Tickets: found ($(tk ls 2>/dev/null | wc -l | tr -d ' '))"
+  else
+    echo "  Tickets: none"
+  fi
+
+  echo ""
+
+  # Decision tree
+  if [[ "$has_change" == "false" && "$has_plan" == "false" && "$has_tix" == "false" ]]; then
+    echo "ERROR: No proposal, plan, or tickets found."
+    echo "Run interview mode first (requires human dialogue):"
+    echo "  rl loop interview"
+    exit 1
+  fi
+
+  # Bootstrap if needed
+  if [[ "$has_tix" == "false" ]]; then
+    echo "--- Auto-bootstrapping: creating tickets from proposal ---"
+    run_claude "$RL_CORE/PROMPT_bootstrap.md"
+    maybe_push
+    echo ""
+    echo "Bootstrap complete. Tickets created:"
+    tk ready 2>/dev/null || echo "(none)"
+    echo ""
+  fi
+
+  # Build loop
+  run_build_mode
+}
+
+# ============================================
+# Main dispatch
+# ============================================
+case "$MODE" in
+  interview)
+    run_interview_mode
+    ;;
+  bootstrap)
+    run_bootstrap_mode
+    ;;
+  amend)
+    run_amend_mode
+    ;;
+  archive)
+    run_archive_mode
+    ;;
+  review)
+    run_review_mode
+    ;;
+  e2e)
+    run_e2e_mode "${POSITIONAL_ARGS[@]+"${POSITIONAL_ARGS[@]}"}"
+    ;;
+  build)
+    if [[ "$AUTO_MODE" == "true" ]]; then
+      run_auto_pipeline
+    else
+      run_build_mode
+    fi
+    ;;
+  *)
+    echo "Unknown mode: $MODE"
+    exit 1
+    ;;
+esac
